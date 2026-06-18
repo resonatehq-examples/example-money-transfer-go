@@ -58,16 +58,20 @@ func (l *ledger) apply(opID, account string, amount float64, note string) float6
 	defer l.mu.Unlock()
 
 	if l.applied[opID] {
-		fmt.Printf("  [ledger] %s already applied (idempotent no-op)\n", opID)
+		if !quietMode {
+			fmt.Printf("  [ledger] %s already applied (idempotent no-op)\n", opID)
+		}
 		return l.balances[account]
 	}
 	l.applied[opID] = true
 	l.balances[account] += amount
-	sign := "+"
-	if amount < 0 {
-		sign = ""
+	if !quietMode {
+		sign := "+"
+		if amount < 0 {
+			sign = ""
+		}
+		fmt.Printf("  [ledger] %s: %s %s%.2f  // %s\n", opID, account, sign, amount, note)
 	}
-	fmt.Printf("  [ledger] %s: %s %s%.2f  // %s\n", opID, account, sign, amount, note)
 	return l.balances[account]
 }
 
@@ -80,6 +84,10 @@ func (l *ledger) balance(account string) float64 {
 // bank is a process-global dependency the step functions write to. An example
 // keeps this simple; a real service would inject a database handle instead.
 var bank = newLedger()
+
+// quietMode suppresses per-step ledger output when true. Set by main before
+// any saga runs. Useful for clean benchmark output when -n>1 or -quiet is set.
+var quietMode bool
 
 // ── Domain types ────────────────────────────────────────────────────────
 
@@ -156,8 +164,10 @@ func refund(_ *resonate.Context, op AccountOp) (OpResult, error) {
 // re-executes from the top on resume, already-settled steps short-circuit by
 // promise id, so a crash mid-saga never double-applies a ledger entry.
 func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, error) {
-	fmt.Printf("\n[saga] transfer %s: %s -> %s  $%.2f\n",
-		args.TransferID, args.Source, args.Target, args.Amount)
+	if !quietMode {
+		fmt.Printf("\n[saga] transfer %s: %s -> %s  $%.2f\n",
+			args.TransferID, args.Source, args.Target, args.Amount)
+	}
 
 	withdrawID := args.TransferID + "-withdraw"
 	depositID := args.TransferID + "-deposit"
@@ -196,14 +206,18 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 		// order; here only the withdraw has settled, so we run exactly its
 		// inverse — a refund back to the source. The same shape scales to N
 		// steps: one `if <step>n { run inverse }` block per step, checked LIFO.
-		fmt.Printf("[saga] deposit failed: %v — compensating\n", err)
+		if !quietMode {
+			fmt.Printf("[saga] deposit failed: %v — compensating\n", err)
+		}
 		if withdrawn {
 			fr, cerr := ctx.Run(refund, AccountOp{OpID: refundID, Account: args.Source, Amount: args.Amount})
 			if cerr == nil {
 				var r OpResult
 				if err := fr.Await(&r); err != nil {
 					// Best-effort rollback: the saga has already failed.
-					fmt.Printf("[saga] refund failed: %v\n", err)
+					if !quietMode {
+						fmt.Printf("[saga] refund failed: %v\n", err)
+					}
 				}
 			}
 		}
@@ -214,7 +228,9 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 		}, nil
 	}
 
-	fmt.Printf("[saga] transfer %s committed\n", args.TransferID)
+	if !quietMode {
+		fmt.Printf("[saga] transfer %s committed\n", args.TransferID)
+	}
 	return TransferResult{
 		TransferID: args.TransferID,
 		Status:     "committed",
@@ -228,16 +244,31 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 
 func main() {
 	serverURL := flag.String("url", "", "Resonate server URL (e.g. http://localhost:8001). Omit to use localnet.")
-	promiseID := flag.String("id", "money-transfer-1", "Promise ID (idempotency key). Re-use the same ID after a crash to re-attach to the existing workflow.")
+	promiseID := flag.String("id", "money-transfer-1", "Promise ID (idempotency key). Re-use the same ID after a crash to re-attach to the existing workflow. In -n mode this becomes the ID prefix.")
 	failDeposit := flag.Bool("fail", false, "Force the deposit step to fail so the saga compensates.")
 	amount := flag.Float64("amount", 50, "Amount to transfer from source to target.")
+	n := flag.Int("n", 1, "Number of transfers to run sequentially. n>1 enables benchmark mode: a count/elapsed summary is printed at the end.")
+	quiet := flag.Bool("quiet", false, "Suppress per-step ledger output. Implied when -n>1 for clean benchmark output.")
 	flag.Parse()
 
-	// Seed the source account so it has funds to send.
+	benchmark := *n > 1
+	// quietMode is a package-level flag read by transferMoney and ledger.apply.
+	// It is set once before any saga runs, so no synchronisation is needed.
+	quietMode = *quiet || benchmark
+
+	// Seed the source account so it has funds to send. In benchmark mode we
+	// seed enough to cover all N transfers without going negative.
 	const source, target = "alice", "bob"
-	bank.apply("seed-"+source, source, 200, "seed")
-	fmt.Printf("opening balances: %s=%.2f %s=%.2f\n",
-		source, bank.balance(source), target, bank.balance(target))
+	seedAmount := 200.0
+	if benchmark {
+		seedAmount = float64(*n) * (*amount) * 2 // generous headroom
+	}
+	bank.apply("seed-"+source, source, seedAmount, "seed")
+
+	if !quietMode {
+		fmt.Printf("opening balances: %s=%.2f %s=%.2f\n",
+			source, bank.balance(source), target, bank.balance(target))
+	}
 
 	var cfg resonate.Config
 	if *serverURL != "" {
@@ -254,8 +285,10 @@ func main() {
 			Heartbeat: resonate.NoopHeartbeat{},
 			TTL:       5 * time.Minute,
 		}
-		fmt.Println("[main] using localnet (in-process, no external server required)")
-		fmt.Println("[main] note: localnet state is ephemeral — crash recovery requires -url=<server>")
+		if !benchmark {
+			fmt.Println("[main] using localnet (in-process, no external server required)")
+			fmt.Println("[main] note: localnet state is ephemeral — crash recovery requires -url=<server>")
+		}
 	}
 
 	r, err := resonate.New(cfg)
@@ -273,33 +306,84 @@ func main() {
 	}
 
 	ctx := context.Background()
-	// The promise ID is the idempotency key. Resonate deduplicates on this ID,
-	// so re-running with the same ID after a crash re-attaches to the existing
-	// workflow rather than starting a new one. Pass -id=<value> to override —
-	// use a fresh ID for the failure run so it isn't served the committed
-	// result cached under the happy-path ID.
-	id := *promiseID
-	args := TransferArgs{
-		TransferID:  id,
-		Source:      source,
-		Target:      target,
-		Amount:      *amount,
-		FailDeposit: *failDeposit,
+
+	if !benchmark {
+		// ── Single-transfer mode ─────────────────────────────────────────────
+		// The promise ID is the idempotency key. Resonate deduplicates on this
+		// ID, so re-running with the same ID after a crash re-attaches to the
+		// existing workflow rather than starting a new one. Pass -id=<value> to
+		// override — use a fresh ID for the failure run so it isn't served the
+		// committed result cached under the happy-path ID.
+		id := *promiseID
+		args := TransferArgs{
+			TransferID:  id,
+			Source:      source,
+			Target:      target,
+			Amount:      *amount,
+			FailDeposit: *failDeposit,
+		}
+
+		fmt.Printf("[main] invoking saga id=%s fail=%t\n", id, *failDeposit)
+
+		h, err := transferFn.Run(ctx, id, args)
+		if err != nil {
+			log.Fatalf("Run: %v", err)
+		}
+
+		out, err := h.Result(ctx)
+		if err != nil {
+			log.Fatalf("Result: %v", err)
+		}
+
+		fmt.Printf("[main] result: %+v\n", out)
+		fmt.Printf("closing balances: %s=%.2f %s=%.2f\n",
+			source, bank.balance(source), target, bank.balance(target))
+		return
 	}
 
-	fmt.Printf("[main] invoking saga id=%s fail=%t\n", id, *failDeposit)
+	// ── Benchmark mode (-n > 1) ──────────────────────────────────────────────
+	// Run N transfers sequentially, each with a unique promise ID derived from
+	// the -id prefix. Per-transfer output is fully suppressed (quietMode guards
+	// both the saga's and the ledger's fmt.Printf calls). A count/elapsed summary
+	// is printed at the end so this can drive throughput benchmarks.
+	//
+	// Each ID is unique so Resonate creates a fresh promise per transfer — this
+	// measures the full create→execute→settle round trip, not cache hits.
+	fmt.Printf("[bench] running %d sequential transfers (id prefix=%s amount=%.2f fail=%t)\n",
+		*n, *promiseID, *amount, *failDeposit)
 
-	h, err := transferFn.Run(ctx, id, args)
-	if err != nil {
-		log.Fatalf("Run: %v", err)
+	committed := 0
+	compensated := 0
+	start := time.Now()
+
+	for i := 0; i < *n; i++ {
+		id := fmt.Sprintf("%s-%d", *promiseID, i+1)
+		args := TransferArgs{
+			TransferID:  id,
+			Source:      source,
+			Target:      target,
+			Amount:      *amount,
+			FailDeposit: *failDeposit,
+		}
+
+		h, err := transferFn.Run(ctx, id, args)
+		if err != nil {
+			log.Fatalf("Run[%d]: %v", i, err)
+		}
+		out, err := h.Result(ctx)
+		if err != nil {
+			log.Fatalf("Result[%d]: %v", i, err)
+		}
+		switch out.Status {
+		case "committed":
+			committed++
+		case "compensated":
+			compensated++
+		}
 	}
 
-	out, err := h.Result(ctx)
-	if err != nil {
-		log.Fatalf("Result: %v", err)
-	}
-
-	fmt.Printf("[main] result: %+v\n", out)
-	fmt.Printf("closing balances: %s=%.2f %s=%.2f\n",
-		source, bank.balance(source), target, bank.balance(target))
+	elapsed := time.Since(start)
+	tps := float64(*n) / elapsed.Seconds()
+	fmt.Printf("[bench] done  n=%d committed=%d compensated=%d elapsed=%s tps=%.1f\n",
+		*n, committed, compensated, elapsed.Round(time.Millisecond), tps)
 }

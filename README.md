@@ -122,6 +122,29 @@ You'll see the withdraw settle, the deposit fail, and a compensating refund rest
 
 > **Localnet limitation:** the server state lives in process memory. A process crash also destroys the ledger and promise state, so the crash-recovery story is not demonstrable in this mode. Use real-server mode below for that.
 
+### Benchmark mode (-n)
+
+Run N sequential transfers and get a count/elapsed/tps summary — useful for throughput benchmarks:
+
+```sh
+go run . -n=100 -id=bench
+```
+
+Output is suppressed automatically in batch mode so only the summary prints:
+
+```
+[bench] running 100 sequential transfers (id prefix=bench amount=50.00 fail=false)
+[bench] done  n=100 committed=100 compensated=0 elapsed=42ms tps=2381.0
+```
+
+Mix in compensations to measure the failure path:
+
+```sh
+go run . -n=50 -id=bench-fail -fail
+```
+
+You can also add `-quiet` to a single-transfer run to suppress ledger output.
+
 ### Real-server mode (crash recovery)
 
 In one terminal, start the dev server:
