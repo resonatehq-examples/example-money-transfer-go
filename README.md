@@ -78,6 +78,8 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 }
 ```
 
+*(In the full [`main.go`](./main.go) the print statements are gated behind a `quietMode` flag so benchmark mode can suppress them; that plumbing is elided above for clarity.)*
+
 `ctx.Run(fn, args)` runs a step as a durable child and returns a `*Future`; `f.Await(&out)` blocks until it settles and decodes the result. The step functions (`withdraw`, `deposit`, `refund`) are passed by value — they don't need to be registered. Only the top-level `transferMoney` saga is registered, because that's what gets invoked by promise ID.
 
 The compensation lives in the error branch, guarded by the `withdrawn` flag, so only the inverse of a settled step runs. The same shape scales to more steps: one `if <step-settled> { run inverse }` block per step, checked in reverse (LIFO) order.
@@ -170,7 +172,10 @@ go run . -url=http://localhost:8001 -fail -id=money-transfer-2
 **Happy path (default):**
 
 ```
+  [ledger] seed-alice: alice +200.00  // seed
 opening balances: alice=200.00 bob=0.00
+[main] using localnet (in-process, no external server required)
+[main] note: localnet state is ephemeral — crash recovery requires -url=<server>
 [main] invoking saga id=money-transfer-1 fail=false
 
 [saga] transfer money-transfer-1: alice -> bob  $50.00
@@ -184,11 +189,17 @@ closing balances: alice=150.00 bob=50.00
 **Compensation path (`-fail`):**
 
 ```
+  [ledger] seed-alice: alice +200.00  // seed
+opening balances: alice=200.00 bob=0.00
+[main] using localnet (in-process, no external server required)
+[main] note: localnet state is ephemeral — crash recovery requires -url=<server>
+[main] invoking saga id=money-transfer-2 fail=true
+
 [saga] transfer money-transfer-2: alice -> bob  $50.00
   [ledger] money-transfer-2-withdraw: alice -50.00  // withdraw
 [saga] deposit failed: application error: account bob rejected the deposit — compensating
   [ledger] money-transfer-2-refund: alice +50.00  // refund
-[main] result: {... Status:compensated ...}
+[main] result: {TransferID:money-transfer-2 Status:compensated Source: Target: Amount:0 Error:application error: account bob rejected the deposit}
 closing balances: alice=200.00 bob=0.00
 ```
 

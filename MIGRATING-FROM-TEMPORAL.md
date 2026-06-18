@@ -115,6 +115,8 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 }
 ```
 
+*(The print statements in the full `main.go` are gated behind a `quietMode` flag so benchmark mode can suppress them; that plumbing is elided above for clarity.)*
+
 `ctx.Run(fn, args)` runs a step as a durable child and returns a `*Future`; `f.Await(&out)` blocks until it settles and decodes the result. When the deposit fails, the error branch runs the inverse of whatever settled — guarded here by `withdrawn`, so only a completed withdraw is refunded.
 
 ## Concept mapping

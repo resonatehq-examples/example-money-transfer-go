@@ -154,9 +154,9 @@ func refund(_ *resonate.Context, op AccountOp) (OpResult, error) {
 // transferMoney moves args.Amount from the source account to the target
 // account as a saga:
 //
-//	1. withdraw the source     (durable checkpoint)
-//	2. deposit the target      (durable checkpoint; may fail)
-//	3. on a deposit failure, compensate inline by refunding the source.
+//  1. withdraw the source     (durable checkpoint)
+//  2. deposit the target      (durable checkpoint; may fail)
+//  3. on a deposit failure, compensate inline by refunding the source.
 //
 // The compensation runs in the error branch, guarded by which steps actually
 // completed — only the inverse of settled steps runs. Each compensation is
