@@ -68,11 +68,12 @@ Each step that needs undoing registers a `defer` immediately after it succeeds. 
 
 ```go
 func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, error) {
+	logf("\n[saga] transfer %s: %s -> %s  $%.2f\n",
+		args.TransferID, args.Source, args.Target, args.Amount)
+
 	withdrawID := args.TransferID + "-withdraw"
 	depositID  := args.TransferID + "-deposit"
 	refundID   := args.TransferID + "-refund"
-
-	withdrawn := false
 
 	// Step 1 — withdraw from the source.
 	f1, err := ctx.Run(withdraw, AccountOp{OpID: withdrawID, Account: args.Source, Amount: args.Amount})
@@ -83,9 +84,8 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 	if err := f1.Await(&w); err != nil {
 		return TransferResult{}, fmt.Errorf("withdraw: %w", err)
 	}
-	withdrawn = true
 
-	// Step 2 — deposit to the target.
+	// Step 2 — deposit to the target. NoRetry so a failure compensates at once.
 	f2, err := ctx.Run(deposit,
 		AccountOp{OpID: depositID, Account: args.Target, Amount: args.Amount, Fail: args.FailDeposit},
 		resonate.RunOpts{RetryPolicy: resonate.NoRetry},
@@ -95,29 +95,26 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 	}
 	var d OpResult
 	if err := f2.Await(&d); err != nil {
-		// Inline guarded compensation: undo only the steps that settled.
-		fmt.Printf("[saga] deposit failed: %v — compensating\n", err)
-		if withdrawn {
-			fr, cerr := ctx.Run(refund, AccountOp{OpID: refundID, Account: args.Source, Amount: args.Amount})
-			if cerr == nil {
-				var r OpResult
-				if err := fr.Await(&r); err != nil {
-					// Best-effort rollback: the saga has already failed.
-					fmt.Printf("[saga] refund failed: %v\n", err)
-				}
+		// The deposit failed after the withdraw settled — undo it by refunding
+		// the source. A longer saga undoes each completed step in reverse (LIFO).
+		logf("[saga] deposit failed: %v — compensating\n", err)
+		fr, cerr := ctx.Run(refund, AccountOp{OpID: refundID, Account: args.Source, Amount: args.Amount})
+		if cerr == nil {
+			var ref OpResult
+			if err := fr.Await(&ref); err != nil {
+				logf("[saga] refund failed: %v\n", err) // best-effort: the saga already failed
 			}
 		}
 		return TransferResult{TransferID: args.TransferID, Status: "compensated", Error: err.Error()}, nil
 	}
 
+	logf("[saga] transfer %s committed\n", args.TransferID)
 	return TransferResult{TransferID: args.TransferID, Status: "committed",
 		Source: args.Source, Target: args.Target, Amount: args.Amount}, nil
 }
 ```
 
-*(The print statements in the full `main.go` are gated behind a `quietMode` flag so benchmark mode can suppress them; that plumbing is elided above for clarity.)*
-
-`ctx.Run(fn, args)` runs a step as a durable child and returns a `*Future`; `f.Await(&out)` blocks until it settles and decodes the result. When the deposit fails, the error branch runs the inverse of whatever settled — guarded here by `withdrawn`, so only a completed withdraw is refunded.
+`ctx.Run(fn, args)` runs a step as a durable child and returns a `*Future`; `f.Await(&out)` blocks until it settles and decodes the result. When the deposit fails, the error branch undoes the one step that completed — the withdraw — by refunding the source. A longer saga tracks which steps settled and undoes them in reverse (LIFO) order. (`logf` is a thin `fmt.Printf` wrapper that prints the trace unless `-quiet` or benchmark mode silences it.)
 
 ## Concept mapping
 
@@ -125,7 +122,7 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 |---|---|---|
 | `workflow.ExecuteActivity(ctx, Withdraw, …).Get(ctx, nil)` | `ctx.Run(withdraw, args)` + `f.Await(&out)` | A step is a plain function made durable by `ctx.Run`. There is no separate activity type and no `@activity`-style annotation. |
 | `Withdraw` / `Deposit` activity funcs (`func(context.Context, T) error`) | `withdraw` / `deposit` step funcs (`func(*resonate.Context, T) (R, error)`) | Resonate steps take `*resonate.Context` and may return a typed result alongside the error. |
-| `defer func(){ if err != nil { …Compensation… } }()` | `if <step-settled> { ctx.Run(<inverse>, …) }` in the error branch | Temporal registers compensation eagerly and runs it via deferred LIFO unwind; Resonate runs it inline, guarded by which steps settled. |
+| `defer func(){ if err != nil { …Compensation… } }()` | inline `ctx.Run(<inverse>, …)` in the error branch | Temporal registers compensation eagerly and runs it via deferred LIFO unwind; Resonate runs it inline. This two-step transfer undoes the one completed step directly; a longer saga guards each inverse on whether its step settled and runs them LIFO. |
 | `WithdrawCompensation` / `DepositCompensation` activities | `refund` step (and one inverse step per forward step) | Compensations are ordinary durable steps too. |
 | `multierr.Append(err, errCompensation)` | explicit handling in the error branch | Resonate has no built-in multierror; decide per step whether a compensation failure should surface or be logged best-effort. |
 | `workflow.ActivityOptions{StartToCloseTimeout, RetryPolicy}` + `WithActivityOptions` | `resonate.RunOpts{Timeout, RetryPolicy}` (optional 3rd arg to `ctx.Run`) | Per-call timeout and retry policy. `resonate.NoRetry` is the single-attempt policy used here so a failure compensates immediately. |
@@ -142,7 +139,7 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 
 3. **Turn each activity call into a `ctx.Run` + `Await`.** `workflow.ExecuteActivity(ctx, Withdraw, d).Get(ctx, nil)` becomes `f, err := ctx.Run(withdraw, op)` then `err := f.Await(&out)`. Drop `WithActivityOptions`; pass `resonate.RunOpts{Timeout, RetryPolicy}` as the optional third argument to `ctx.Run` only where you need a non-default timeout or retry policy.
 
-4. **Replace the `defer` compensation stack with inline guarded undo.** Instead of registering a `defer` after each successful step, track which steps settled (a boolean per step) and, in the error branch, run the inverse of each settled step in reverse order. The forward step's result and its compensation are right next to each other in the code path that triggered them.
+4. **Replace the `defer` compensation stack with inline undo.** Instead of registering a `defer` after each successful step, undo the completed steps in the error branch. For this two-step transfer that is a single refund of the one step that settled; for a longer saga, track which steps settled (a boolean per step) and run the inverse of each in reverse order. Either way the forward step and its compensation sit in the same code path rather than in a separate deferred stack.
 
 5. **Make every step idempotent.** Temporal threads a `ReferenceID` through the activities; here, derive a deterministic op id per step from the saga's promise ID (`<id>-withdraw`, etc.) and have each step short-circuit if that op id was already applied. This keeps a replay after a crash from double-applying an entry.
 

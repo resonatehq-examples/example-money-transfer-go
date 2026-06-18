@@ -3,11 +3,13 @@
 //
 // A transfer moves money between two accounts in an in-memory ledger as two
 // durable steps: withdraw from the source, then deposit to the target. If the
-// deposit fails, the workflow compensates inline by refunding the source, so
-// the ledger is never left in a half-applied state. Each step is durable (its
-// result is recorded in a promise) and idempotent (keyed by a deterministic
-// operation id), so a worker crash mid-transfer replays without double-applying
-// an entry.
+// deposit fails, the saga compensates inline by refunding the source, so the
+// ledger is never left half-applied.
+//
+// Two layers keep a crash safe. The promise layer: a settled ctx.Run step is
+// not re-executed when the workflow resumes — its result is replayed from the
+// durable promise. The ledger layer: every entry is keyed by a deterministic
+// operation id, so even a step that does re-run applies its entry at most once.
 //
 // # Modes
 //
@@ -19,6 +21,8 @@
 //	resonate dev                                  # terminal 1
 //	go run . -url=http://localhost:8001           # terminal 2 (happy path)
 //	go run . -url=http://localhost:8001 -fail -id=money-transfer-2  # compensation
+//
+// Pass -n>1 to run a batch of transfers and print a throughput summary.
 package main
 
 import (
@@ -32,6 +36,21 @@ import (
 	resonate "github.com/resonatehq/resonate-sdk-go"
 	"github.com/resonatehq/resonate-sdk-go/localnet"
 )
+
+// verbose controls the play-by-play logging. It is set once in main before any
+// saga runs — so the worker goroutines that read it through logf never race the
+// write — and lets benchmark mode (-n>1) or -quiet silence the trace. logf is
+// the single reader.
+var verbose = true
+
+// logf prints the play-by-play unless verbose has been turned off. Centralizing
+// the check keeps the saga and the ledger readable: each line of narration is a
+// single call rather than a wrapped if-block.
+func logf(format string, a ...any) {
+	if verbose {
+		fmt.Printf(format, a...)
+	}
+}
 
 // ── Ledger ──────────────────────────────────────────────────────────────
 //
@@ -58,20 +77,17 @@ func (l *ledger) apply(opID, account string, amount float64, note string) float6
 	defer l.mu.Unlock()
 
 	if l.applied[opID] {
-		if !quietMode {
-			fmt.Printf("  [ledger] %s already applied (idempotent no-op)\n", opID)
-		}
+		logf("  [ledger] %s already applied (idempotent no-op)\n", opID)
 		return l.balances[account]
 	}
 	l.applied[opID] = true
 	l.balances[account] += amount
-	if !quietMode {
-		sign := "+"
-		if amount < 0 {
-			sign = ""
-		}
-		fmt.Printf("  [ledger] %s: %s %s%.2f  // %s\n", opID, account, sign, amount, note)
+
+	sign := "+"
+	if amount < 0 {
+		sign = ""
 	}
+	logf("  [ledger] %s: %s %s%.2f  // %s\n", opID, account, sign, amount, note)
 	return l.balances[account]
 }
 
@@ -84,10 +100,6 @@ func (l *ledger) balance(account string) float64 {
 // bank is a process-global dependency the step functions write to. An example
 // keeps this simple; a real service would inject a database handle instead.
 var bank = newLedger()
-
-// quietMode suppresses per-step ledger output when true. Set by main before
-// any saga runs. Useful for clean benchmark output when -n>1 or -quiet is set.
-var quietMode bool
 
 // ── Domain types ────────────────────────────────────────────────────────
 
@@ -154,27 +166,20 @@ func refund(_ *resonate.Context, op AccountOp) (OpResult, error) {
 // transferMoney moves args.Amount from the source account to the target
 // account as a saga:
 //
-//  1. withdraw the source     (durable checkpoint)
-//  2. deposit the target      (durable checkpoint; may fail)
-//  3. on a deposit failure, compensate inline by refunding the source.
+//  1. withdraw the source   (durable step)
+//  2. deposit the target    (durable step; may fail)
+//  3. on a deposit failure, compensate by refunding the source.
 //
-// The compensation runs in the error branch, guarded by which steps actually
-// completed — only the inverse of settled steps runs. Each compensation is
-// itself a durable, idempotent ctx.Run step. Because the workflow body
-// re-executes from the top on resume, already-settled steps short-circuit by
-// promise id, so a crash mid-saga never double-applies a ledger entry.
+// Each step is a ctx.Run child. On resume the body re-executes from the top,
+// but settled steps short-circuit by promise id, so a crash mid-saga never
+// repeats a completed step or double-applies a ledger entry.
 func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, error) {
-	if !quietMode {
-		fmt.Printf("\n[saga] transfer %s: %s -> %s  $%.2f\n",
-			args.TransferID, args.Source, args.Target, args.Amount)
-	}
+	logf("\n[saga] transfer %s: %s -> %s  $%.2f\n",
+		args.TransferID, args.Source, args.Target, args.Amount)
 
 	withdrawID := args.TransferID + "-withdraw"
 	depositID := args.TransferID + "-deposit"
 	refundID := args.TransferID + "-refund"
-
-	// Track which steps have settled, so compensation only undoes real work.
-	withdrawn := false
 
 	// Step 1 — withdraw from the source.
 	f1, err := ctx.Run(withdraw, AccountOp{OpID: withdrawID, Account: args.Source, Amount: args.Amount})
@@ -186,7 +191,6 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 		// Nothing has moved yet — no compensation required.
 		return TransferResult{}, fmt.Errorf("withdraw: %w", err)
 	}
-	withdrawn = true
 
 	// Step 2 — deposit to the target. RetryPolicy: NoRetry is intentional —
 	// this saga's compensation IS the response to a deposit-side failure, so we
@@ -202,23 +206,17 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 	}
 	var d OpResult
 	if err := f2.Await(&d); err != nil {
-		// Inline guarded compensation. Undo the completed steps in reverse
-		// order; here only the withdraw has settled, so we run exactly its
-		// inverse — a refund back to the source. The same shape scales to N
-		// steps: one `if <step>n { run inverse }` block per step, checked LIFO.
-		if !quietMode {
-			fmt.Printf("[saga] deposit failed: %v — compensating\n", err)
-		}
-		if withdrawn {
-			fr, cerr := ctx.Run(refund, AccountOp{OpID: refundID, Account: args.Source, Amount: args.Amount})
-			if cerr == nil {
-				var r OpResult
-				if err := fr.Await(&r); err != nil {
-					// Best-effort rollback: the saga has already failed.
-					if !quietMode {
-						fmt.Printf("[saga] refund failed: %v\n", err)
-					}
-				}
+		// The deposit failed after the withdraw settled, so the transfer is
+		// half-done. Undo the one step that completed by refunding the source.
+		// A longer saga undoes each completed step in reverse order — track
+		// which settled and run their inverses LIFO. The refund is itself a
+		// durable, idempotent ctx.Run step.
+		logf("[saga] deposit failed: %v — compensating\n", err)
+		fr, cerr := ctx.Run(refund, AccountOp{OpID: refundID, Account: args.Source, Amount: args.Amount})
+		if cerr == nil {
+			var ref OpResult
+			if err := fr.Await(&ref); err != nil {
+				logf("[saga] refund failed: %v\n", err) // best-effort: the saga has already failed
 			}
 		}
 		return TransferResult{
@@ -228,9 +226,7 @@ func transferMoney(ctx *resonate.Context, args TransferArgs) (TransferResult, er
 		}, nil
 	}
 
-	if !quietMode {
-		fmt.Printf("[saga] transfer %s committed\n", args.TransferID)
-	}
+	logf("[saga] transfer %s committed\n", args.TransferID)
 	return TransferResult{
 		TransferID: args.TransferID,
 		Status:     "committed",
@@ -247,14 +243,12 @@ func main() {
 	promiseID := flag.String("id", "money-transfer-1", "Promise ID (idempotency key). Re-use the same ID after a crash to re-attach to the existing workflow. In -n mode this becomes the ID prefix.")
 	failDeposit := flag.Bool("fail", false, "Force the deposit step to fail so the saga compensates.")
 	amount := flag.Float64("amount", 50, "Amount to transfer from source to target.")
-	n := flag.Int("n", 1, "Number of transfers to run sequentially. n>1 enables benchmark mode: a count/elapsed summary is printed at the end.")
-	quiet := flag.Bool("quiet", false, "Suppress per-step ledger output. Implied when -n>1 for clean benchmark output.")
+	n := flag.Int("n", 1, "Number of transfers to run sequentially. n>1 enables benchmark mode: a throughput summary is printed at the end.")
+	quiet := flag.Bool("quiet", false, "Suppress the per-step play-by-play and print only the final result. Implied by -n>1.")
 	flag.Parse()
 
 	benchmark := *n > 1
-	// quietMode is a package-level flag read by transferMoney and ledger.apply.
-	// It is set once before any saga runs, so no synchronisation is needed.
-	quietMode = *quiet || benchmark
+	verbose = !(*quiet || benchmark)
 
 	// Seed the source account so it has funds to send. In benchmark mode we
 	// seed enough to cover all N transfers without going negative.
@@ -264,17 +258,14 @@ func main() {
 		seedAmount = float64(*n) * (*amount) * 2 // generous headroom
 	}
 	bank.apply("seed-"+source, source, seedAmount, "seed")
-
-	if !quietMode {
-		fmt.Printf("opening balances: %s=%.2f %s=%.2f\n",
-			source, bank.balance(source), target, bank.balance(target))
-	}
+	logf("opening balances: %s=%.2f %s=%.2f\n",
+		source, bank.balance(source), target, bank.balance(target))
 
 	var cfg resonate.Config
 	if *serverURL != "" {
 		// Real-server mode: crash recovery is fully demonstrable here.
 		cfg = resonate.Config{URL: *serverURL}
-		fmt.Printf("[main] connecting to server at %s\n", *serverURL)
+		logf("[main] connecting to server at %s\n", *serverURL)
 	} else {
 		// Localnet mode: in-process transport, no external server needed.
 		// NoopHeartbeat is required — localnet has no HTTP endpoint for the
@@ -285,10 +276,8 @@ func main() {
 			Heartbeat: resonate.NoopHeartbeat{},
 			TTL:       5 * time.Minute,
 		}
-		if !benchmark {
-			fmt.Println("[main] using localnet (in-process, no external server required)")
-			fmt.Println("[main] note: localnet state is ephemeral — crash recovery requires -url=<server>")
-		}
+		logf("[main] using localnet (in-process, no external server required)\n")
+		logf("[main] note: localnet state is ephemeral — crash recovery requires -url=<server>\n")
 	}
 
 	r, err := resonate.New(cfg)
@@ -323,7 +312,7 @@ func main() {
 			FailDeposit: *failDeposit,
 		}
 
-		fmt.Printf("[main] invoking saga id=%s fail=%t\n", id, *failDeposit)
+		logf("[main] invoking saga id=%s fail=%t\n", id, *failDeposit)
 
 		h, err := transferFn.Run(ctx, id, args)
 		if err != nil {
@@ -336,16 +325,15 @@ func main() {
 		}
 
 		fmt.Printf("[main] result: %+v\n", out)
-		fmt.Printf("closing balances: %s=%.2f %s=%.2f\n",
+		logf("closing balances: %s=%.2f %s=%.2f\n",
 			source, bank.balance(source), target, bank.balance(target))
 		return
 	}
 
 	// ── Benchmark mode (-n > 1) ──────────────────────────────────────────────
 	// Run N transfers sequentially, each with a unique promise ID derived from
-	// the -id prefix. Per-transfer output is fully suppressed (quietMode guards
-	// both the saga's and the ledger's fmt.Printf calls). A count/elapsed summary
-	// is printed at the end so this can drive throughput benchmarks.
+	// the -id prefix. The play-by-play is silenced (verbose=false), and a
+	// throughput summary is printed at the end so this can drive benchmarks.
 	//
 	// Each ID is unique so Resonate creates a fresh promise per transfer — this
 	// measures the full create→execute→settle round trip, not cache hits.
