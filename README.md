@@ -91,7 +91,7 @@ The compensation lives in the error branch: when the deposit fails, the one step
   ```sh
   brew install resonatehq/tap/resonate
   ```
-  Other install paths: <https://docs.resonatehq.io/get-started/install>.
+  Other install paths: <https://docs.resonatehq.io/get-started/quickstart>.
 
 ## Setup
 
@@ -218,7 +218,7 @@ example-money-transfer-go/
 
 - **Coming from Temporal?** See [MIGRATING-FROM-TEMPORAL.md](MIGRATING-FROM-TEMPORAL.md) — a side-by-side port of the matching `temporalio/samples-go` example.
 - [Get started](https://docs.resonatehq.io/get-started) — install paths + first-program walkthrough.
-- [Durable execution concepts](https://docs.resonatehq.io/concepts) — what makes invocations durable and how the runtime resumes them.
+- [Durable execution concepts](https://docs.resonatehq.io/learn/durable-execution) — what makes invocations durable and how the runtime resumes them.
 - [`example-durable-sleep-go`](https://github.com/resonatehq-examples/example-durable-sleep-go) — durable timers that survive worker restarts.
 - [`example-human-in-the-loop-go`](https://github.com/resonatehq-examples/example-human-in-the-loop-go) — pause a workflow on an external decision via a latent promise.
 
